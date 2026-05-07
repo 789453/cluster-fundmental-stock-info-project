@@ -1,0 +1,26 @@
+2026-04-22 23:21:29 | INFO | pipeline | load dataset
+2026-04-22 23:21:29 | INFO | pipeline | npy root missing or empty; fallback to csv text embedding
+2026-04-22 23:21:29 | INFO | pipeline | build view features
+2026-04-22 23:21:29 | INFO | pipeline | building csv text embeddings for 16 views
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=profile_text shape=(20, 64) explained=1.0
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=product_text shape=(20, 64) explained=1.0000000000000002
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=model_text shape=(20, 64) explained=0.9999999999999998
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=chain_text shape=(20, 64) explained=0.9999999999999998
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=theme_text shape=(20, 64) explained=1.0
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=full_text shape=(20, 64) explained=1.0000000000000002
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=business_model_json shape=(20, 64) explained=1.0
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=industry_chain_position_json shape=(20, 64) explained=1.0000000000000002
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=business_logic_json shape=(20, 64) explained=1.0000000000000004
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=structural_themes_json shape=(20, 64) explained=1.0000000000000002
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=business_scope_keywords_json shape=(20, 64) explained=1.0000000000000004
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=core_products_services_json shape=(20, 64) explained=1.0
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=application_scenarios_json shape=(20, 64) explained=1.0
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=end_markets_json shape=(20, 64) explained=0.9999999999999999
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=customer_types_json shape=(20, 64) explained=0.9999999999999997
+2026-04-22 23:21:29 | INFO | pipeline | csv tfidf embedding built | view=uncertainties_json shape=(20, 64) explained=1.0
+2026-04-22 23:21:29 | INFO | pipeline | build anchor and quality features
+2026-04-22 23:21:29 | INFO | pipeline | run clustering
+2026-04-22 23:21:29 | INFO | pipeline | build prototypes
+2026-04-22 23:21:29 | INFO | pipeline | build graphs
+2026-04-22 23:21:29 | INFO | pipeline | assemble export tables
+2026-04-22 23:21:32 | INFO | pipeline | pipeline done | {'run_dir': 'D:\\Trading\\a_share_semantic_engine_project\\outputs\\run_20260422_232129', 'rows': 20, 'num_feature_dims': 146, 'num_clusters': 6, 'graph_edges': 214, 'avg_degree': 10.7, 'views_used': ['application_scenarios_json', 'business_logic_json', 'business_model_json', 'business_scope_keywords_json', 'chain_text', 'core_products_services_json', 'customer_types_json', 'end_markets_json', 'full_text', 'industry_chain_position_json', 'model_text', 'product_text', 'profile_text', 'structural_themes_json', 'theme_text', 'uncertainties_json']}

@@ -1,0 +1,29 @@
+# Do not upload NumPy binary data files
+*.npy
+*.npz
+
+# Do not upload joblib model/cache files
+*.joblib
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter cache
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets / local environment files
+.env
+*.env
+

@@ -1,0 +1,26 @@
+{
+  "run_dir": "D:\\Trading\\a_share_semantic_engine_project\\outputs\\run_20260422_232129",
+  "rows": 20,
+  "num_feature_dims": 146,
+  "num_clusters": 6,
+  "graph_edges": 214,
+  "avg_degree": 10.7,
+  "views_used": [
+    "application_scenarios_json",
+    "business_logic_json",
+    "business_model_json",
+    "business_scope_keywords_json",
+    "chain_text",
+    "core_products_services_json",
+    "customer_types_json",
+    "end_markets_json",
+    "full_text",
+    "industry_chain_position_json",
+    "model_text",
+    "product_text",
+    "profile_text",
+    "structural_themes_json",
+    "theme_text",
+    "uncertainties_json"
+  ]
+}

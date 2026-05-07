@@ -1,0 +1,8 @@
+{
+  "created_at": "2026-04-14T14:59:46+00:00",
+  "record_count": 0,
+  "failure_count": 0,
+  "run_count": 0,
+  "parquet_shards": 0,
+  "vector_shards": {}
+}

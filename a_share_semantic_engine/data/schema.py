@@ -1,0 +1,30 @@
+REQUIRED_COLUMNS = [
+    "record_id",
+    "stock_code",
+    "stock_name",
+    "asof_date",
+    "confidence",
+    "source_quality_note",
+    "profile_text",
+    "product_text",
+    "model_text",
+    "chain_text",
+    "theme_text",
+    "full_text",
+    "biz_form",
+    "customer_side",
+    "chain_level",
+]
+
+OPTIONAL_JSON_COLUMNS = [
+    "business_model_json",
+    "industry_chain_position_json",
+    "business_logic_json",
+    "structural_themes_json",
+    "business_scope_keywords_json",
+    "core_products_services_json",
+    "application_scenarios_json",
+    "end_markets_json",
+    "customer_types_json",
+    "uncertainties_json",
+]
