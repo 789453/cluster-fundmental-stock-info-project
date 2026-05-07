@@ -1,0 +1,491 @@
+from __future__ import annotations
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+try:
+    import faiss
+    HAS_FAISS = True
+except ImportError:
+    HAS_FAISS = False
+
+try:
+    import torch
+    HAS_TORCH = True
+    HAS_CUDA = torch.cuda.is_available()
+except ImportError:
+    HAS_TORCH = False
+    HAS_CUDA = False
+
+
+class VectorStore:
+    def __init__(self, npy_root: str | Path, meta_dir: str | Path | None = None):
+        self.npy_root = Path(npy_root)
+        self.meta_dir = Path(meta_dir) if meta_dir else self.npy_root.parent / "metadata"
+        self._views: dict[str, np.ndarray] = {}
+        self._row_ids: dict[str, list[str]] = {}
+        self._meta_cache: dict[str, dict] = {}
+
+    def load_view(self, view: str) -> tuple[np.ndarray, list[str]]:
+        """
+        Load a single view's vectors and row_ids from merged npy + meta.json.
+
+        Returns:
+            vectors: float32 array shape (N, 1024)
+            row_ids: list of record_id strings aligned to rows
+        """
+        if view in self._views:
+            return self._views[view], self._row_ids[view]
+
+        meta_path = self.meta_dir / f"records.jsonl"
+        npy_path = self.npy_root / view / f"{view}-all.npy"
+
+        if not npy_path.exists():
+            raise FileNotFoundError(f"NPY not found: {npy_path}")
+
+        vectors = np.load(npy_path).astype(np.float32)
+
+        row_ids: list[str] = []
+        if meta_path.exists():
+            with open(meta_path, encoding="utf-8") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    if view in rec.get("vector_paths", {}):
+                        row_ids.append(rec.get("record_id", rec.get("ts_code", "")))
+
+        if not row_ids:
+            row_ids = [f"row_{i}" for i in range(len(vectors))]
+
+        if len(row_ids) != len(vectors):
+            logger.warning("row_id count (%d) != vector rows (%d), padding", len(row_ids), len(vectors))
+            while len(row_ids) < len(vectors):
+                row_ids.append(f"row_{len(row_ids)}")
+
+        self._views[view] = vectors
+        self._row_ids[view] = row_ids
+        self._meta_cache[view] = {
+            "view": view,
+            "rows": len(vectors),
+            "dim": vectors.shape[1] if len(vectors.shape) > 1 else 0,
+            "dtype": str(vectors.dtype),
+        }
+        logger.info("Loaded view '%s': shape=%s, dtype=%s", view, vectors.shape, vectors.dtype)
+        return vectors, row_ids
+
+    def get_index(self, view: str, ts_codes: list[str]) -> np.ndarray | None:
+        """
+        Get vector row indices for a list of ts_codes.
+        Requires alignment between ts_code and row_id.
+        """
+        _, row_ids = self.load_view(view)
+        code_to_idx: dict[str, int] = {}
+        for i, rid in enumerate(row_ids):
+            code_to_idx[rid] = i
+        indices = [code_to_idx[c] for c in ts_codes if c in code_to_idx]
+        return np.array(indices) if indices else None
+
+    def l2_normalize(self, vectors: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)
+        return (vectors / norms).astype(np.float32)
+
+    def validate_alignment(self, view: str, ts_codes: list[str]) -> float:
+        """
+        Validate that row_ids match ts_codes and return match ratio.
+        """
+        _, row_ids = self.load_view(view)
+        matched = sum(1 for c in ts_codes if c in row_ids)
+        return matched / len(ts_codes) if ts_codes else 0.0
+
+    def summary(self) -> dict[str, dict]:
+        return {
+            view: {
+                "rows": self._meta_cache.get(view, {}).get("rows", 0),
+                "dim": self._meta_cache.get(view, {}).get("dim", 0),
+                "dtype": self._meta_cache.get(view, {}).get("dtype", "unknown"),
+            }
+            for view in self._views
+        }
+
+
+def build_semantic_knn(
+    vectors: np.ndarray,
+    k: int = 30,
+    min_sim: float = 0.0,
+    mutual: bool = True,
+    backend: str = "exact",
+    device_id: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build kNN adjacency matrix from semantic vectors.
+
+    Args:
+        vectors: float32 array shape (N, D), assumed L2-normalized.
+        k: number of nearest neighbors per node.
+        min_sim: minimum cosine similarity threshold.
+        mutual: if True, only keep edges where both nodes are in each other's kNN.
+        backend: 'exact' (numpy), 'faiss_cpu', 'faiss_gpu'.
+        device_id: GPU device id if using GPU.
+
+    Returns:
+        neighbors: (N, k) int array of neighbor indices
+        distances: (N, k) float32 array of cosine similarities
+        weights: (N, k) float32 array of edge weights
+    """
+    N = len(vectors)
+    k = min(k, N - 1)
+
+    if backend == "exact" or not HAS_FAISS:
+        return _exact_knn(vectors, k, min_sim, mutual)
+
+    if backend.startswith("faiss"):
+        return _faiss_knn(vectors, k, min_sim, mutual, backend, device_id)
+
+    return _exact_knn(vectors, k, min_sim, mutual)
+
+
+def _exact_knn(vectors: np.ndarray, k: int, min_sim: float, mutual: bool):
+    N = len(vectors)
+    sim_mat = vectors @ vectors.T
+    np.fill_diagonal(sim_mat, -1.0)
+
+    neigh = np.zeros((N, k), dtype=np.int32)
+    dists = np.zeros((N, k), dtype=np.float32)
+
+    for i in range(N):
+        top_k_idx = np.argpartition(sim_mat[i], -k)[-k:]
+        top_k_idx = top_k_idx[np.argsort(sim_mat[i][top_k_idx])[::-1]]
+        neigh[i] = top_k_idx[:k]
+        dists[i] = sim_mat[i][top_k_idx[:k]]
+
+    if mutual:
+        mask = np.zeros((N, N), dtype=bool)
+        for i in range(N):
+            for j_idx in range(k):
+                j = neigh[i, j_idx]
+                if i in neigh[j]:
+                    mask[i, j] = True
+
+        new_neigh = np.zeros((N, k), dtype=np.int32)
+        new_dists = np.zeros((N, k), dtype=np.float32)
+        for i in range(N):
+            m = mask[i]
+            candidates = np.where(m)[0]
+            if len(candidates) > k:
+                top = np.argsort(sim_mat[i][candidates])[-k:]
+                new_neigh[i] = candidates[top]
+                new_dists[i] = sim_mat[i][new_neigh[i]]
+            elif len(candidates) > 0:
+                new_neigh[i, :len(candidates)] = candidates
+                new_dists[i, :len(candidates)] = sim_mat[i][candidates]
+        neigh, dists = new_neigh, new_dists
+
+    weights = dists.clip(min=min_sim).astype(np.float32)
+    return neigh, dists, weights
+
+
+def _faiss_knn(vectors: np.ndarray, k: int, min_sim: float, mutual: bool, backend: str, device_id: int):
+    N, D = vectors.shape
+    k = min(k, N - 1)
+
+    if backend == "faiss_gpu" and HAS_FAISS:
+        res = faiss.StandardGpuResources()
+        flat = faiss.GpuIndexFlatIP(res, D)
+        flat.add(vectors)
+        sims, idxs = flat.search(vectors, k + 1)
+        sims = sims[:, 1:].astype(np.float32)
+        idxs = idxs[:, 1:].astype(np.int32)
+    else:
+        index = faiss.IndexFlatIP(D)
+        if backend == "faiss_gpu":
+            co = faiss.GpuClonerOptions()
+            gpu_index = faiss.GpuIndexFlatIP(index, device_id, co)
+            gpu_index.add(vectors)
+            sims, idxs = gpu_index.search(vectors, k + 1)
+        else:
+            index.add(vectors)
+            sims, idxs = index.search(vectors, k + 1)
+        sims = sims[:, 1:].astype(np.float32)
+        idxs = idxs[:, 1:].astype(np.int32)
+
+    if mutual:
+        mask = np.zeros((N, N), dtype=bool)
+        for i in range(N):
+            for j_idx in range(k):
+                j = idxs[i, j_idx]
+                if 0 <= j < N and i in idxs[j]:
+                    mask[i, j] = True
+        new_idxs = np.zeros((N, k), dtype=np.int32)
+        new_sims = np.zeros((N, k), dtype=np.float32)
+        for i in range(N):
+            m = mask[i]
+            candidates = np.where(m)[0]
+            if len(candidates) > k:
+                top = np.argsort(sims[i, :k][candidates])[-k:]
+                new_idxs[i] = candidates[top]
+                new_sims[i] = sims[i, :k][candidates][top]
+            elif len(candidates) > 0:
+                new_idxs[i, :len(candidates)] = candidates
+                new_sims[i, :len(candidates)] = sims[i, :k][candidates]
+        idxs, sims = new_idxs, new_sims
+
+    weights = sims.clip(min=min_sim).astype(np.float32)
+    return idxs, sims, weights
+
+
+def build_industry_graph(
+    ts_codes: list[str],
+    sw_l1: list[str] | None = None,
+    sw_l2: list[str] | None = None,
+    sw_l3: list[str] | None = None,
+    l1_weight: float = 0.4,
+    l2_weight: float = 0.7,
+    l3_weight: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build industry similarity graph from SW industry membership.
+
+    Args:
+        ts_codes: list of stock codes.
+        sw_l1/l2/l3: corresponding SW industry codes/labels.
+        l*_weight: edge weight for same L1/L2/L3 industry.
+
+    Returns:
+        neighbors, distances, weights (same format as build_semantic_knn).
+    """
+    N = len(ts_codes)
+    adj = np.zeros((N, N), dtype=np.float32)
+
+    for i in range(N):
+        for j in range(i + 1, N):
+            w = 0.0
+            if sw_l1 and sw_l1[i] and sw_l1[i] == sw_l1[j]:
+                w = max(w, l1_weight)
+            if sw_l2 and sw_l2[i] and sw_l2[i] == sw_l2[j]:
+                w = max(w, l2_weight)
+            if sw_l3 and sw_l3[i] and sw_l3[i] == sw_l3[j]:
+                w = max(w, l3_weight)
+            if w > 0:
+                adj[i, j] = w
+                adj[j, i] = w
+
+    degrees = adj.sum(axis=1)
+    k = int(np.median(degrees[degrees > 0])) if degrees[degrees > 0].size > 0 else 1
+    k = max(k, 1)
+
+    neigh = np.zeros((N, k), dtype=np.int32)
+    dists = np.zeros((N, k), dtype=np.float32)
+    weights_out = np.zeros((N, k), dtype=np.float32)
+
+    for i in range(N):
+        row = adj[i]
+        top_idx = np.argsort(row)[::-1][:k]
+        neigh[i] = top_idx
+        dists[i] = row[top_idx]
+        weights_out[i] = row[top_idx]
+
+    return neigh, dists, weights_out
+
+
+def build_fundamental_graph(
+    feature_matrix: np.ndarray,
+    k: int = 20,
+    weight_type: str = "cosine",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build fundamental similarity graph from z-scored financial features.
+    """
+    N, D = feature_matrix.shape
+    mu = feature_matrix.mean(axis=0)
+    sigma = feature_matrix.std(axis=0)
+    sigma = np.where(sigma == 0, 1, sigma)
+    z = ((feature_matrix - mu) / sigma).astype(np.float32)
+
+    sim_mat = z @ z.T / D
+    np.fill_diagonal(sim_mat, -1.0)
+
+    k = min(k, N - 1)
+    neigh = np.zeros((N, k), dtype=np.int32)
+    dists = np.zeros((N, k), dtype=np.float32)
+
+    for i in range(N):
+        top_idx = np.argpartition(sim_mat[i], -k)[-k:]
+        top_idx = top_idx[np.argsort(sim_mat[i][top_idx])[::-1]]
+        neigh[i] = top_idx
+        dists[i] = sim_mat[i][top_idx]
+
+    weights = dists.clip(0.0).astype(np.float32)
+    return neigh, dists, weights
+
+
+def build_return_corr_graph(
+    returns: np.ndarray,
+    k: int = 30,
+    min_corr: float = 0.1,
+    window: int = 60,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build return correlation graph from rolling return series.
+
+    Args:
+        returns: float32 array shape (N, T) where T is number of periods.
+        k: max neighbors.
+        min_corr: minimum correlation threshold.
+        window: rolling window for correlation (used if T > window).
+    """
+    N, T = returns.shape
+
+    if T > window:
+        roll = min(window, T)
+        rets = returns[:, -roll:]
+    else:
+        rets = returns
+
+    corr_mat = np.corrcoef(rets).astype(np.float32)
+    np.fill_diagonal(corr_mat, -1.0)
+    corr_mat = np.where(corr_mat < min_corr, 0.0, corr_mat)
+
+    k = min(k, N - 1)
+    neigh = np.zeros((N, k), dtype=np.int32)
+    dists = np.zeros((N, k), dtype=np.float32)
+
+    for i in range(N):
+        top_idx = np.argpartition(corr_mat[i], -k)[-k:]
+        top_idx = top_idx[np.argsort(corr_mat[i][top_idx])[::-1]]
+        neigh[i] = top_idx
+        dists[i] = corr_mat[i][top_idx]
+
+    weights = dists.clip(0.0).astype(np.float32)
+    return neigh, dists, weights
+
+
+def build_style_graph(
+    style_vectors: np.ndarray,
+    k: int = 20,
+    tau: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build style exposure similarity graph.
+
+    Edge weight: exp(- ||style_i - style_j||_2 / tau)
+    """
+    N, D = style_vectors.shape
+    diff = style_vectors[:, None, :] - style_vectors[None, :, :]
+    l2_dist = np.sqrt((diff ** 2).sum(axis=2))
+    sim_mat = np.exp(-l2_dist / tau).astype(np.float32)
+    np.fill_diagonal(sim_mat, -1.0)
+
+    k = min(k, N - 1)
+    neigh = np.zeros((N, k), dtype=np.int32)
+    dists = np.zeros((N, k), dtype=np.float32)
+
+    for i in range(N):
+        top_idx = np.argpartition(sim_mat[i], -k)[-k:]
+        top_idx = top_idx[np.argsort(sim_mat[i][top_idx])[::-1]]
+        neigh[i] = top_idx
+        dists[i] = sim_mat[i][top_idx]
+
+    weights = dists.clip(0.0).astype(np.float32)
+    return neigh, dists, weights
+
+
+def fuse_multiplex_graphs(
+    graph_dict: dict[str, tuple[np.ndarray, np.ndarray]],
+    weights: dict[str, float],
+) -> np.ndarray:
+    """
+    Fuse multiple graphs with given weights.
+
+    Args:
+        graph_dict: {name: (neighbors, distances)} for each graph type.
+        weights: {name: fusion_weight}.
+
+    Returns:
+        fused_neighbors (N, k) - neighbors from fused weighted average.
+    """
+    names = list(graph_dict.keys())
+    N = graph_dict[names[0]][0].shape[0]
+    k = graph_dict[names[0]][0].shape[1]
+
+    fused_sim = np.zeros((N, N), dtype=np.float32)
+    total_w = 0.0
+
+    for name in names:
+        w = weights.get(name, 0.0)
+        if w == 0:
+            continue
+        neigh, dists = graph_dict[name]
+        mat = np.zeros((N, N), dtype=np.float32)
+        for i in range(N):
+            for j_idx in range(len(neigh[i])):
+                j = neigh[i, j_idx]
+                mat[i, j] = dists[i, j_idx]
+        fused_sim += w * mat
+        total_w += w
+
+    if total_w > 0:
+        fused_sim /= total_w
+
+    # Collect all possible neighbors from all graphs (union of k-NN sets)
+    neighbor_sets = [set() for _ in range(N)]
+    for name in names:
+        neigh, dists = graph_dict[name]
+        for i in range(N):
+            neighbor_sets[i].update(neigh[i].tolist())
+
+    fused_neigh = np.zeros((N, k), dtype=np.int32)
+    fused_dists = np.zeros((N, k), dtype=np.float32)
+
+    for i in range(N):
+        # Only consider neighbors that appear in at least one input graph
+        valid_neighbors = [n for n in neighbor_sets[i] if 0 <= n < N and n != i]
+
+        if not valid_neighbors:
+            continue
+
+        # Get similarities for these valid neighbors only
+        valid_neighbors = np.array(valid_neighbors, dtype=np.int32)
+        sims = fused_sim[i, valid_neighbors]
+
+        # Select top k from valid neighbors
+        if len(valid_neighbors) >= k:
+            top_local_idx = np.argpartition(sims, -k)[-k:]
+            top_local_idx = top_local_idx[np.argsort(sims[top_local_idx])[::-1]]
+            fused_neigh[i] = valid_neighbors[top_local_idx]
+            fused_dists[i] = sims[top_local_idx]
+        else:
+            sorted_idx = np.argsort(sims)[::-1]
+            fused_neigh[i, :len(valid_neighbors)] = valid_neighbors[sorted_idx]
+            fused_dists[i, :len(valid_neighbors)] = sims[sorted_idx]
+
+    return fused_neigh, fused_dists, fused_sim
+
+
+def build_csr_from_knn(neighbors: np.ndarray, distances: np.ndarray, N: int) -> tuple[Any, np.ndarray, np.ndarray]:
+    """
+    Build scipy CSR sparse matrix from kNN arrays.
+    Returns (csr_matrix, row_idx, col_idx).
+    """
+    from scipy import sparse
+
+    rows = np.repeat(np.arange(N), neighbors.shape[1])
+    cols = neighbors.flatten()
+    data = distances.flatten()
+
+    mask = (cols >= 0) & (cols < N)
+    rows = rows[mask]
+    cols = cols[mask]
+    data = data[mask]
+
+    csr = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
+    csr = csr.tocsr()
+    csr = (csr + csr.T) / 2.0
+
+    return csr, rows, cols

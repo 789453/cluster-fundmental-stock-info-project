@@ -1,0 +1,46 @@
+{
+  "graphs": {
+    "semantic": {
+      "edge_count": 45889,
+      "avg_degree": 10.941,
+      "isolated_count": 14,
+      "isolated_ratio": "0.26%",
+      "density": 0.003246
+    },
+    "industry": {
+      "edge_count": 494089,
+      "avg_degree": 97.466,
+      "isolated_count": 0,
+      "isolated_ratio": "0.00%",
+      "density": 0.034948
+    },
+    "fundamental": {
+      "edge_count": 104791,
+      "avg_degree": 30.465,
+      "isolated_count": 0,
+      "isolated_ratio": "0.00%",
+      "density": 0.007412
+    },
+    "return_corr": {
+      "edge_count": 45889,
+      "avg_degree": 10.941,
+      "isolated_count": 14,
+      "isolated_ratio": "0.26%",
+      "density": 0.003246
+    },
+    "style": {
+      "edge_count": 76125,
+      "avg_degree": 6.838,
+      "isolated_count": 0,
+      "isolated_ratio": "0.00%",
+      "density": 0.005384
+    },
+    "fused": {
+      "edge_count": 120054,
+      "avg_degree": 1.0,
+      "isolated_count": 0,
+      "isolated_ratio": "0.00%",
+      "density": 0.008492
+    }
+  }
+}
