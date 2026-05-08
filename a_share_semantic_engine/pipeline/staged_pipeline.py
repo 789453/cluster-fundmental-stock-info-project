@@ -679,6 +679,8 @@ class ReportStage(Stage):
 
         logger.info("[Stage8] computing metrics...")
         logger.info("[Stage8] labels: len=%d unique=%s", len(labels), len(np.unique(labels)) if len(labels) > 0 else "EMPTY")
+        logger.info("[Stage8] DEBUG: cluster_df columns=%s", list(cluster_df.columns))
+        logger.info("[Stage8] DEBUG: cluster_df head=\n%s", cluster_df.head())
 
         modularity = compute_modularity(fused_csr, labels)
         conductance = compute_conductance(fused_csr, labels)

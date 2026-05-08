@@ -267,11 +267,13 @@ class TestFullStagedPipeline:
 
         from a_share_semantic_engine.pipeline.staged_pipeline import run_staged_pipeline
 
+        NPY_ROOT = Path(__file__).parent.parent.parent / "artifacts" / "a_share_semantic_dataset" / "npy"
+
         with tempfile.TemporaryDirectory() as tmpdir:
             result = run_staged_pipeline(
                 trade_date="20260423",
                 warehouse_db=str(WAREHOUSE_DB),
-                npy_root="nonexistent",
+                npy_root=str(NPY_ROOT),
                 output_dir=tmpdir,
                 cluster_method="kmeans",
                 start_from_stage=1,
