@@ -36,3 +36,12 @@ Thumbs.db
 # Do not upload outputs directory
 outputs/
 outputs/**
+
+# Do not upload numpy/joblib binary files
+*.npy
+*.npz
+*.joblib
+
+# Do not upload outputs directory
+outputs/
+outputs/**

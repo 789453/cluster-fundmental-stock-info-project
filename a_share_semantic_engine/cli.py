@@ -93,9 +93,10 @@ def cmd_staged(trade_date: str, config_path: str, start_from: int, cluster_metho
     )
 
     report = result.get("report", {})
-    n_clusters = report.get("n_clusters", 0)
-    modularity = report.get("modularity", 0.0)
-    nmi = report.get("nmi", 0.0)
+    report_payload = report.get("report", report)
+    n_clusters = report_payload.get("n_clusters", 0)
+    modularity = report_payload.get("modularity", 0.0)
+    nmi = report_payload.get("nmi", 0.0)
     print(f"staged complete | n_clusters={n_clusters} | modularity={modularity:.4f} | nmi={nmi:.4f}")
     return 0
 

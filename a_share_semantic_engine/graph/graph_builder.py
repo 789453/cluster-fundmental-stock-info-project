@@ -90,26 +90,18 @@ class VectorStore:
     def get_index(self, view: str, keys: list[str]) -> np.ndarray | None:
         """
         Get vector row indices for a list of keys (either record_ids or stock_codes).
+        Returns a fixed-length array with -1 for unmatched keys.
         """
         _, row_ids, stock_codes = self.load_view(view)
-        
-        # Try record_id first, then stock_code
+
         key_to_idx: dict[str, int] = {}
         for i, rid in enumerate(row_ids):
             if rid: key_to_idx[rid] = i
         for i, code in enumerate(stock_codes):
             if code: key_to_idx[code] = i
-            
-        indices = [key_to_idx[k] for k in keys if k in key_to_idx]
-        
-        # DEBUG PRINT
-        if not indices and keys:
-            print(f"\nDEBUG: get_index failed for {view}")
-            print(f"DEBUG: Sample keys: {keys[:3]}")
-            print(f"DEBUG: Sample row_ids: {row_ids[:3]}")
-            print(f"DEBUG: Sample stock_codes: {stock_codes[:3]}\n")
-            
-        return np.array(indices) if indices else None
+
+        indices = np.array([key_to_idx.get(k, -1) for k in keys], dtype=np.int64)
+        return indices
 
     def l2_normalize(self, vectors: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
@@ -120,8 +112,9 @@ class VectorStore:
         """
         Validate that row_ids match ts_codes and return match ratio.
         """
-        _, row_ids = self.load_view(view)
-        matched = sum(1 for c in ts_codes if c in row_ids)
+        _, row_ids, stock_codes = self.load_view(view)
+        key_set = set(row_ids) | set(stock_codes)
+        matched = sum(1 for c in ts_codes if c in key_set)
         return matched / len(ts_codes) if ts_codes else 0.0
 
     def summary(self) -> dict[str, dict]:
@@ -246,12 +239,16 @@ def _faiss_knn(vectors: np.ndarray, k: int, min_sim: float, mutual: bool, backen
             m = mask[i]
             candidates = np.where(m)[0]
             if len(candidates) > k:
-                top = np.argsort(sims[i, :k][candidates])[-k:]
+                sim_map = {int(idxs[i, j]): float(sims[i, j]) for j in range(k)}
+                candidate_sims = np.array([sim_map.get(int(c), 0.0) for c in candidates], dtype=np.float32)
+                top = np.argsort(candidate_sims)[-k:]
                 new_idxs[i] = candidates[top]
-                new_sims[i] = sims[i, :k][candidates][top]
+                new_sims[i] = candidate_sims[top]
             elif len(candidates) > 0:
+                sim_map = {int(idxs[i, j]): float(sims[i, j]) for j in range(k)}
+                candidate_sims = np.array([sim_map.get(int(c), 0.0) for c in candidates], dtype=np.float32)
                 new_idxs[i, :len(candidates)] = candidates
-                new_sims[i, :len(candidates)] = sims[i, :k][candidates]
+                new_sims[i, :len(candidates)] = candidate_sims
         idxs, sims = new_idxs, new_sims
 
     weights = sims.clip(min=min_sim).astype(np.float32)
@@ -266,48 +263,94 @@ def build_industry_graph(
     l1_weight: float = 0.4,
     l2_weight: float = 0.7,
     l3_weight: float = 1.0,
+    max_neighbors_per_level: dict[str, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build industry similarity graph from SW industry membership.
+    Build industry similarity graph from SW industry membership using sparse group construction.
 
     Args:
         ts_codes: list of stock codes.
         sw_l1/l2/l3: corresponding SW industry codes/labels.
         l*_weight: edge weight for same L1/L2/L3 industry.
+        max_neighbors_per_level: max neighbors per level per node.
 
     Returns:
         neighbors, distances, weights (same format as build_semantic_knn).
     """
+    from scipy import sparse
+
+    if max_neighbors_per_level is None:
+        max_neighbors_per_level = {"l3": 40, "l2": 25, "l1": 15}
+
     N = len(ts_codes)
-    adj = np.zeros((N, N), dtype=np.float32)
+    rows_list, cols_list, data_list = [], [], []
+
+    def add_edges(group_indices: list[int], weight: float, max_k: int) -> None:
+        if len(group_indices) <= 1:
+            return
+        for idx_i, i in enumerate(group_indices):
+            candidates = [j for j in group_indices if j != i]
+            k = min(max_k, len(candidates))
+            if k == 0:
+                continue
+            for j in candidates[:k]:
+                rows_list.append(i)
+                cols_list.append(j)
+                data_list.append(weight)
+
+    l3_groups: dict[str, list[int]] = {}
+    l2_groups: dict[str, list[int]] = {}
+    l1_groups: dict[str, list[int]] = {}
+
+    for i, code in enumerate(ts_codes):
+        l3 = sw_l3[i] if sw_l3 and i < len(sw_l3) else ""
+        l2 = sw_l2[i] if sw_l2 and i < len(sw_l2) else ""
+        l1 = sw_l1[i] if sw_l1 and i < len(sw_l1) else ""
+
+        if l3:
+            l3_groups.setdefault(l3, []).append(i)
+        if l2:
+            l2_groups.setdefault(l2, []).append(i)
+        if l1:
+            l1_groups.setdefault(l1, []).append(i)
+
+    for l3_name, indices in l3_groups.items():
+        add_edges(indices, l3_weight, max_neighbors_per_level.get("l3", 40))
+
+    for l2_name, indices in l2_groups.items():
+        add_edges(indices, l2_weight, max_neighbors_per_level.get("l2", 25))
+
+    for l1_name, indices in l1_groups.items():
+        add_edges(indices, l1_weight, max_neighbors_per_level.get("l1", 15))
+
+    if not rows_list:
+        return np.zeros((N, 1), dtype=np.int32), np.zeros((N, 1), dtype=np.float32), np.zeros((N, 1), dtype=np.float32)
+
+    rows = np.array(rows_list, dtype=np.int32)
+    cols = np.array(cols_list, dtype=np.int32)
+    data = np.array(data_list, dtype=np.float32)
+
+    csr = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
+    csr = csr.maximum(csr.T)
+
+    k_max = int(np.median(np.diff(csr.indptr))) + 1
+    k_max = max(k_max, 1)
+
+    neigh = np.zeros((N, k_max), dtype=np.int32)
+    dists = np.zeros((N, k_max), dtype=np.float32)
+    weights_out = np.zeros((N, k_max), dtype=np.float32)
 
     for i in range(N):
-        for j in range(i + 1, N):
-            w = 0.0
-            if sw_l1 and sw_l1[i] and sw_l1[i] == sw_l1[j]:
-                w = max(w, l1_weight)
-            if sw_l2 and sw_l2[i] and sw_l2[i] == sw_l2[j]:
-                w = max(w, l2_weight)
-            if sw_l3 and sw_l3[i] and sw_l3[i] == sw_l3[j]:
-                w = max(w, l3_weight)
-            if w > 0:
-                adj[i, j] = w
-                adj[j, i] = w
-
-    degrees = adj.sum(axis=1)
-    k = int(np.median(degrees[degrees > 0])) if degrees[degrees > 0].size > 0 else 1
-    k = max(k, 1)
-
-    neigh = np.zeros((N, k), dtype=np.int32)
-    dists = np.zeros((N, k), dtype=np.float32)
-    weights_out = np.zeros((N, k), dtype=np.float32)
-
-    for i in range(N):
-        row = adj[i]
-        top_idx = np.argsort(row)[::-1][:k]
-        neigh[i] = top_idx
-        dists[i] = row[top_idx]
-        weights_out[i] = row[top_idx]
+        row_data = csr.getrow(i)
+        nnz = row_data.nnz
+        if nnz > 0:
+            j_indices = row_data.indices
+            values = row_data.data
+            sorted_idx = np.argsort(values)[::-1]
+            k_use = min(nnz, k_max)
+            neigh[i, :k_use] = j_indices[sorted_idx[:k_use]]
+            dists[i, :k_use] = values[sorted_idx[:k_use]]
+            weights_out[i, :k_use] = values[sorted_idx[:k_use]]
 
     return neigh, dists, weights_out
 
@@ -486,7 +529,7 @@ def fuse_multiplex_graphs(
     return fused_neigh, fused_dists, fused_sim
 
 
-def build_csr_from_knn(neighbors: np.ndarray, distances: np.ndarray, N: int) -> tuple[Any, np.ndarray, np.ndarray]:
+def build_csr_from_knn(neighbors: np.ndarray, distances: np.ndarray, N: int, eps: float = 1e-8) -> tuple[Any, np.ndarray, np.ndarray]:
     """
     Build scipy CSR sparse matrix from kNN arrays.
     Returns (csr_matrix, row_idx, col_idx).
@@ -497,13 +540,21 @@ def build_csr_from_knn(neighbors: np.ndarray, distances: np.ndarray, N: int) -> 
     cols = neighbors.flatten()
     data = distances.flatten()
 
-    mask = (cols >= 0) & (cols < N)
+    mask = (
+        (cols >= 0) &
+        (cols < N) &
+        (rows != cols) &
+        np.isfinite(data) &
+        (data > eps)
+    )
     rows = rows[mask]
     cols = cols[mask]
     data = data[mask]
 
     csr = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
     csr = csr.tocsr()
-    csr = (csr + csr.T) / 2.0
+    csr = csr.maximum(csr.T)
+    csr.setdiag(0)
+    csr.eliminate_zeros()
 
     return csr, rows, cols

@@ -1,4 +1,8 @@
 from __future__ import annotations
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "4"
+
 import logging
 from typing import Any
 
@@ -38,43 +42,28 @@ def run_kmeans(
     seed: int = 42,
     batch_size: int = 256,
     max_iter: int = 100,
-    use_gpu: bool = True,
+    use_gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    KMeans clustering. Uses FAISS if available, otherwise sklearn MiniBatchKMeans.
+    KMeans clustering using FAISS with proper data validation.
     """
-    try:
-        import faiss
-        X = np.ascontiguousarray(features.astype(np.float32))
-        D = X.shape[1]
-        
-        # FAISS KMeans
-        # Check if GPU is actually available in FAISS
-        actual_gpu = use_gpu and hasattr(faiss, 'StandardGpuResources')
-        if use_gpu and not actual_gpu:
-            logger.info("FAISS GPU not available, using CPU for KMeans")
-            
-        kmeans = faiss.Kmeans(d=D, k=n_clusters, niter=max_iter, verbose=False, seed=seed, gpu=actual_gpu)
-        kmeans.train(X)
-        
-        dists, labels = kmeans.index.search(X, 1)
-        return labels.flatten().astype(np.int32), np.sqrt(dists.flatten()).astype(np.float32)
-        
-    except (ImportError, AttributeError, Exception) as e:
-        logger.warning("FAISS KMeans failed or not available (Error: %s), falling back to sklearn MiniBatchKMeans", e)
-        from sklearn.cluster import MiniBatchKMeans
+    import faiss
 
-        model = MiniBatchKMeans(
-            n_clusters=n_clusters,
-            batch_size=batch_size,
-            max_iter=max_iter,
-            random_state=seed,
-            n_init="auto",
-        )
-        labels = model.fit_predict(features)
-        centers = model.cluster_centers_[labels]
-        dists = np.linalg.norm(features - centers, axis=1).astype(np.float32)
-        return labels.astype(np.int32), dists
+    X = np.ascontiguousarray(features.astype(np.float32))
+    N, D = X.shape
+
+    if N < n_clusters:
+        logger.warning("KMeans: N=%d < n_clusters=%d, reducing to N clusters", N, n_clusters)
+        n_clusters = max(1, N)
+
+    if N < 2 * n_clusters:
+        logger.warning("KMeans: insufficient data for reliable clustering, N=%d n_clusters=%d", N, n_clusters)
+
+    kmeans = faiss.Kmeans(d=D, k=n_clusters, niter=max_iter, verbose=False, seed=seed, gpu=False)
+    kmeans.train(X)
+
+    dists, labels = kmeans.index.search(X, 1)
+    return labels.flatten().astype(np.int32), np.sqrt(dists.flatten()).astype(np.float32)
 
 
 def run_hdbscan(
@@ -117,11 +106,15 @@ def run_leiden(
 
         N = adj.shape[0]
         sources, targets = adj.nonzero()
-        weights = adj[sources, targets].A1 if hasattr(adj, "A") else np.ones(len(sources))
+        weights = np.asarray(adj[sources, targets]).ravel().astype(np.float32)
 
-        g = ig.Graph(N, edges=list(zip(sources.tolist(), targets.tolist())), directed=False)
-        if len(weights) == g.ecount():
-            g.es["weight"] = weights.tolist()
+        mask = sources < targets
+        edges = list(zip(sources[mask].tolist(), targets[mask].tolist()))
+        edge_weights = weights[mask].tolist() if len(weights) == len(sources) else None
+
+        g = ig.Graph(N, edges=edges, directed=False)
+        if edge_weights and len(edge_weights) == g.ecount():
+            g.es["weight"] = edge_weights
 
         part = la.find_partition(
             g,

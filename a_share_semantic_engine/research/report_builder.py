@@ -103,14 +103,16 @@ def build_research_report(
     report["cluster_stats"] = cluster_stats
 
     if "l1_name" in merged.columns:
+        agg_dict = {"count": ("ts_code", "count")}
+        if "pct_chg" in merged.columns:
+            agg_dict["avg_return"] = ("pct_chg", "mean")
+        if "pe_ttm" in merged.columns:
+            agg_dict["avg_pe"] = ("pe_ttm", "mean")
+        if "roe" in merged.columns:
+            agg_dict["avg_roe"] = ("roe", "mean")
         industry_stats = (
             merged.groupby("l1_name")
-            .agg(
-                count=("ts_code", "count"),
-                avg_return=("pct_chg", "mean"),
-                avg_pe=("pe_ttm", "mean"),
-                avg_roe=("roe", "mean"),
-            )
+            .agg(**agg_dict)
             .reset_index()
             .rename(columns={"l1_name": "sw_l1_name"})
             .to_dict("records")

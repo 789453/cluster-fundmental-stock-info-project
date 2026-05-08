@@ -52,6 +52,24 @@ class Stage:
             data[f.stem] = pd.read_parquet(f)
         for f in self.stage_dir.glob("*.csv"):
             data[f.stem] = pd.read_csv(f)
+        for f in self.stage_dir.glob("*.npz"):
+            data[f.stem] = sparse.load_npz(str(f)).tocsr()
+        for f in self.stage_dir.glob("*.json"):
+            if f.name == "manifest.json":
+                continue
+            data[f.stem] = json.loads(f.read_text(encoding="utf-8"))
+
+        if self.name == "graph_builder":
+            graphs = {}
+            for key, val in data.items():
+                if key.startswith("graph_") and sparse.issparse(val):
+                    graphs[key.replace("graph_", "", 1)] = val.tocsr()
+            if graphs:
+                data["graphs"] = graphs
+
+        if self.name == "fusion" and "fused_csr" in data:
+            data["fused_csr"] = data["fused_csr"].tocsr()
+
         logger.info("[%s] loaded from cache: %s", self.name, self.stage_dir)
         return data
 
@@ -75,6 +93,10 @@ class Stage:
                 manifest[key] = int(val)
             elif isinstance(val, (np.float32, np.float64)):
                 manifest[key] = float(val)
+            elif isinstance(val, (dict, list, tuple)):
+                p = self.stage_dir / f"{key}.json"
+                p.write_text(json.dumps(val, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+                manifest[f"{key}.json"] = str(p)
             elif val is None or isinstance(val, (str, int, float, bool)):
                 manifest[key] = val
 
@@ -163,6 +185,63 @@ class BarraStage(Stage):
 
 
 # ---------------------------------------------------------------------------
+# Stage 2b: Price Features (continuous market data)
+# ---------------------------------------------------------------------------
+
+class PriceFeatureStage(Stage):
+    name = "price_features"
+    cache_subdir = "stage2b_price_features"
+
+    def run(self, input_data: dict, context: dict) -> dict:
+        from ..features.price_panel import build_price_feature_panel, build_returns_matrix
+
+        snap: pd.DataFrame = input_data["snapshot"]["df"]
+        ts_codes = snap["ts_code"].tolist()
+        trade_date = context["trade_date"]
+        warehouse_db = context["warehouse_db"]
+
+        logger.info("[Stage2b] building price features for %d stocks", len(ts_codes))
+
+        price_features, returns_matrix = build_price_feature_panel(
+            warehouse_db=warehouse_db,
+            trade_date=trade_date,
+            ts_codes=ts_codes,
+            windows=(5, 20, 60, 120, 252),
+        )
+
+        returns_mask = (returns_matrix != 0).any(axis=1) if returns_matrix.size > 0 else np.array([])
+
+        manifest = {
+            "n_stocks": len(ts_codes),
+            "n_timesteps": returns_matrix.shape[1] if returns_matrix.size > 0 else 0,
+            "features": list(price_features.columns),
+        }
+
+        if price_features is not None and not price_features.empty:
+            self._save({
+                "price_features": price_features,
+                "returns_matrix": returns_matrix,
+                "returns_mask": returns_mask,
+                "manifest": manifest,
+            })
+
+        return {
+            "price_features": price_features,
+            "returns_matrix": returns_matrix,
+            "manifest": manifest,
+        }
+
+    def validate(self, output: dict) -> bool:
+        pf = output.get("price_features")
+        if pf is None or pf.empty:
+            logger.warning("[Stage2b] No price features generated")
+            return True
+        assert len(pf) > 4000, f"Expected >4000 stocks, got {len(pf)}"
+        logger.info("[Stage2b] validate OK: %d stocks, %d features", len(pf), len(pf.columns) - 1)
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Stage 3: Semantic Vectors
 # ---------------------------------------------------------------------------
 
@@ -186,9 +265,9 @@ class SemanticStage(Stage):
 
         for v in available_views:
             try:
-                vectors, row_ids = vs.load_view(v)
+                vectors, row_ids, stock_codes = vs.load_view(v)
                 idx_map = vs.get_index(v, ts_codes)
-                if idx_map is not None and len(idx_map) == len(ts_codes):
+                if idx_map is not None and len(idx_map) == len(ts_codes) and np.all(idx_map >= 0):
                     feat_matrix = vectors[idx_map]
                     view_used = v
                     logger.info("  view '%s' aligned: shape=%s", v, feat_matrix.shape)
@@ -292,10 +371,12 @@ class GraphBuilderStage(Stage):
         ret_cols = [f"ret_{d}d" for d in [1, 5, 20, 60]]
         avail_ret = [c for c in ret_cols if c in snap.columns]
         if len(avail_ret) >= 2:
+            logger.warning("[Stage4] return_corr graph using single-day snapshot returns, not continuous panel. Consider building PriceFeatureStage first for proper return correlation.")
             ret_mat = np.nan_to_num(snap[avail_ret].values.astype(np.float32), nan=0.0)
-            neigh_ret, dist_ret, w_ret = build_return_corr_graph(ret_mat.T, k=20)
-            ret_csr, _, _ = build_csr_from_knn(neigh_ret, dist_ret, N)
-            graphs["return_corr"] = ret_csr
+            if ret_mat.shape[0] == len(ts_codes):
+                neigh_ret, dist_ret, w_ret = build_return_corr_graph(ret_mat, k=20)
+                ret_csr, _, _ = build_csr_from_knn(neigh_ret, dist_ret, N)
+                graphs["return_corr"] = ret_csr
 
         style_cols = [c for c in style.columns if c.endswith("_sw_neutral")]
         if len(style_cols) >= 3:
@@ -308,6 +389,28 @@ class GraphBuilderStage(Stage):
             "graphs": list(graphs.keys()),
             "n_nodes": N,
         }
+
+        from ..graph.edge_table import save_all_graphs, save_edge_tables
+
+        save_all_graphs(graphs, self.stage_dir / "csr")
+        save_edge_tables(graphs, ts_codes, self.stage_dir / "edges")
+
+        graph_quality = []
+        for name, adj in graphs.items():
+            rows, cols = adj.nonzero()
+            w = np.asarray(adj[rows, cols]).flatten()
+            graph_quality.append({
+                "graph_name": name,
+                "n_nodes": N,
+                "nnz": adj.nnz,
+                "edge_count": len(rows) // 2,
+                "avg_degree": float(adj.sum() / N),
+                "isolated_count": int((np.diff(adj.indptr) == 0).sum()),
+                "weight_mean": float(w.mean()) if len(w) > 0 else 0.0,
+            })
+        graph_quality_df = pd.DataFrame(graph_quality)
+        graph_quality_df.to_parquet(self.stage_dir / "graph_quality.parquet", index=False)
+
         self._save({f"graph_{k}": v for k, v in graphs.items()} | {"manifest": manifest})
 
         return {"graphs": graphs, "manifest": manifest}
@@ -339,7 +442,7 @@ class GraphFusionStage(Stage):
     cache_subdir = "stage5_fusion"
 
     def run(self, input_data: dict, context: dict) -> dict:
-        from ..graph.graph_builder import fuse_multiplex_graphs, build_csr_from_knn
+        from ..graph.fusion import fuse_sparse_graphs
 
         graphs_raw = input_data.get("graph_builder")
         if graphs_raw is None:
@@ -358,42 +461,31 @@ class GraphFusionStage(Stage):
         logger.info("[Stage5] fusing %d graphs with weights %s", len(graphs), fusion_weights)
 
         N = next(iter(graphs.values())).shape[0]
-        k = 30
+        topk = context.get("fusion_topk", 30)
 
-        kNN_dict = {}
-        for name, adj in graphs.items():
-            rows, cols = adj.nonzero()
-            w = np.asarray(adj[rows, cols]).flatten()
-            mask_upper = rows < cols
-            rows_u, cols_u, w_u = rows[mask_upper], cols[mask_upper], w[mask_upper]
-            neigh_per_node: dict[int, list] = {i: [] for i in range(N)}
-            dist_per_node: dict[int, list] = {i: [] for i in range(N)}
-            for r, c, weight in zip(rows_u, cols_u, w_u):
-                if r != c:
-                    neigh_per_node[r].append((c, weight))
-                    neigh_per_node[c].append((r, weight))
-            neigh = np.full((N, k), 0, dtype=np.int32)
-            dists = np.zeros((N, k), dtype=np.float32)
-            for i in range(N):
-                sorted_nb = sorted(neigh_per_node[i], key=lambda x: -x[1])[:k]
-                for j_idx, (_, dw) in enumerate(sorted_nb):
-                    neigh[i, j_idx] = 0
-                    dists[i, j_idx] = 0.0
-                for j_idx, (nb, dw) in enumerate(sorted_nb):
-                    neigh[i, j_idx] = nb
-                    dists[i, j_idx] = dw
-            kNN_dict[name] = (neigh, dists)
-
-        fused_neigh, fused_dists, fused_sim = fuse_multiplex_graphs(kNN_dict, fusion_weights)
-        fused_csr, _, _ = build_csr_from_knn(fused_neigh, fused_dists, N)
+        fused_csr = fuse_sparse_graphs(
+            graphs,
+            fusion_weights,
+            normalize="max",
+            topk=topk,
+            min_weight=1e-6,
+        )
 
         avg_deg = fused_csr.sum() / N
         logger.info("[Stage5] fused graph: edges=%d avg_deg=%.3f", fused_csr.nnz // 2, avg_deg)
+
+        from ..graph.edge_table import save_all_graphs, save_edge_tables
+
+        save_all_graphs({"fused": fused_csr}, self.stage_dir / "csr")
+        snap_for_fusion: pd.DataFrame = input_data.get("snapshot", {}).get("df", pd.DataFrame())
+        if not snap_for_fusion.empty:
+            save_edge_tables({"fused": fused_csr}, snap_for_fusion["ts_code"].tolist(), self.stage_dir / "edges")
 
         manifest = {
             "avg_degree": float(avg_deg),
             "n_edges": fused_csr.nnz // 2,
             "weights_used": fusion_weights,
+            "topk": topk,
         }
         self._save({"fused_csr": fused_csr, "manifest": manifest})
 
@@ -559,7 +651,6 @@ class ReportStage(Stage):
 
         snap: pd.DataFrame = input_data["snapshot"]["df"]
         barra: pd.DataFrame = input_data["barra"]["df"]
-        labels: np.ndarray = input_data["clustering"]["labels"]
         cluster_df: pd.DataFrame = input_data["clustering"]["cluster_df"]
         metrics_df: pd.DataFrame = input_data["graph_metrics"]["metrics_df"]
         fused_csr: sparse.csr_matrix = input_data["fusion"]["fused_csr"]
@@ -574,10 +665,20 @@ class ReportStage(Stage):
             graphs = graphs_raw
         trade_date: str = context["trade_date"]
 
+        if cluster_df is None or cluster_df.empty or "cluster_id" not in cluster_df.columns:
+            raise ValueError(f"cluster_df is invalid: {cluster_df}")
+
+        if "cluster_distance" not in cluster_df.columns:
+            logger.warning("[Stage8] cluster_distance missing from cluster_df, adding default")
+            cluster_df = cluster_df.copy()
+            cluster_df["cluster_distance"] = 0.0
+
+        labels: np.ndarray = cluster_df["cluster_id"].values
         snap = snap.copy()
         snap["cluster_id"] = labels
 
         logger.info("[Stage8] computing metrics...")
+        logger.info("[Stage8] labels: len=%d unique=%s", len(labels), len(np.unique(labels)) if len(labels) > 0 else "EMPTY")
 
         modularity = compute_modularity(fused_csr, labels)
         conductance = compute_conductance(fused_csr, labels)
@@ -602,6 +703,10 @@ class ReportStage(Stage):
         if "cluster_id" in barra.columns:
             barra_sel_cols.append("cluster_id")
         style_df = barra[barra_sel_cols + style_cols].copy() if style_cols else None
+
+        if style_df is not None and "cluster_id" not in style_df.columns:
+            style_df = style_df.copy()
+            style_df["cluster_id"] = labels
 
         cluster_profile = build_cluster_profile(labels, snap["ts_code"].tolist(), snap, style_df)
 
@@ -631,13 +736,13 @@ class ReportStage(Stage):
         data_q = build_data_quality_report(
             snap, style_df,
             vector_coverage=1.0 if input_data["semantic"]["manifest"].get("view_used") else 0.0,
-            output_dir=self.stage_dir / "data_quality_report.json",
+            output_path=self.stage_dir / "data_quality_report.json",
         )
 
         graph_q = build_graph_quality_report(
             {k: (v,) for k, v in graphs.items()},
             snap["ts_code"].tolist(),
-            output_dir=self.stage_dir / "graph_quality_report.json",
+            output_path=self.stage_dir / "graph_quality_report.json",
         )
 
         edge_df = build_edge_table(fused_csr, snap["ts_code"].tolist(), edge_type="fused")
@@ -663,18 +768,86 @@ class ReportStage(Stage):
 
 
 # ---------------------------------------------------------------------------
+# Stage 9: Visualization (read-only from saved artifacts)
+# ---------------------------------------------------------------------------
+
+class VisualizationStage(Stage):
+    name = "visualization"
+    cache_subdir = "stage9_visualization"
+
+    def run(self, input_data: dict, context: dict) -> dict:
+        from ..graph.edge_table import load_all_graphs
+        from ..viz.plots import plot_cluster_sizes, plot_degree_histogram
+
+        snap_dir = self.output_dir / "stage1_snapshot"
+        graphs_dir = self.output_dir / "stage4_graphs"
+        fusion_dir = self.output_dir / "stage5_fusion"
+        cluster_dir = self.output_dir / "stage6_clustering"
+        metrics_dir = self.output_dir / "stage7_graph_metrics"
+
+        snap_path = snap_dir / "df.parquet"
+        if snap_path.exists():
+            snap = pd.read_parquet(snap_path)
+        else:
+            snap = pd.DataFrame()
+
+        cluster_path = cluster_dir / "cluster_df.parquet"
+        if cluster_path.exists():
+            cluster_df = pd.read_parquet(cluster_path)
+        else:
+            cluster_df = pd.DataFrame()
+
+        metrics_path = metrics_dir / "metrics_df.parquet"
+        if metrics_path.exists():
+            metrics_df = pd.read_parquet(metrics_path)
+        else:
+            metrics_df = pd.DataFrame()
+
+        fused_csr = None
+        fused_path = fusion_dir / "csr" / "graph_fused.csr.npz"
+        if fused_path.exists():
+            fused_csr = sparse.load_npz(str(fused_path)).tocsr()
+
+        fig_dir = self.stage_dir / "figures"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        if not cluster_df.empty:
+            sizes = cluster_df["cluster_id"].value_counts().sort_index().values
+            plot_cluster_sizes(sizes.tolist(), fig_dir / "01_cluster_size_bar.png")
+
+        if not metrics_df.empty and "degree" in metrics_df.columns:
+            plot_degree_histogram(metrics_df["degree"].values, fig_dir / "02_graph_degree_distribution.png")
+
+        manifest = {
+            "figures_generated": len(list(fig_dir.glob("*.png"))),
+            "snapshot_rows": len(snap),
+            "cluster_rows": len(cluster_df),
+            "metrics_rows": len(metrics_df),
+        }
+        self._save({"manifest": manifest})
+
+        return {"manifest": manifest}
+
+    def validate(self, output: dict) -> bool:
+        logger.info("[Stage9] visualization OK")
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Pipeline Runner
 # ---------------------------------------------------------------------------
 
 STAGE_CLASSES = [
     SnapshotStage,
     BarraStage,
+    PriceFeatureStage,
     SemanticStage,
     GraphBuilderStage,
     GraphFusionStage,
     ClusteringStage,
     GraphMetricsStage,
     ReportStage,
+    VisualizationStage,
 ]
 
 
@@ -711,6 +884,14 @@ def run_staged_pipeline(
     }
 
     stage_data: dict[str, Any] = {}
+
+    if start_from_stage > 1:
+        for stage_cls in STAGE_CLASSES[:start_from_stage - 1]:
+            stage = stage_cls(output_dir)
+            cached = stage.load_cached()
+            if cached is None:
+                raise FileNotFoundError(f"Required cache missing for previous stage: {stage.name}")
+            stage_data[stage.name] = cached
 
     for stage_cls in STAGE_CLASSES[max(0, start_from_stage - 1):]:
         stage = stage_cls(output_dir)

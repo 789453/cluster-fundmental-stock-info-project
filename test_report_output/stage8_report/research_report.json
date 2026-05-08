@@ -1,0 +1,143 @@
+{
+  "trade_date": "20240101",
+  "generated_by": "a_share_semantic_engine",
+  "universe_size": 100,
+  "modularity": 0.0073076666391092455,
+  "nmi_sw_l1": 0.04130835257842818,
+  "purity_sw_l1": 0.45,
+  "n_clusters": 0,
+  "n_unclustered": 100,
+  "cluster_stats": [],
+  "industry_stats": [
+    {
+      "sw_l1_name": "医药",
+      "count": 33
+    },
+    {
+      "sw_l1_name": "地产",
+      "count": 29
+    },
+    {
+      "sw_l1_name": "银行",
+      "count": 38
+    }
+  ],
+  "cluster_style_exposures": [
+    {
+      "cluster_id": 0,
+      "size_sw_neutral": 0.05286340937362654,
+      "value_sw_neutral": -0.09248688053885812,
+      "mom1m_sw_neutral": -0.17422172626930443
+    },
+    {
+      "cluster_id": 1,
+      "size_sw_neutral": 0.0873392950563011,
+      "value_sw_neutral": -0.5316771455744977,
+      "mom1m_sw_neutral": -0.34590719931090386
+    },
+    {
+      "cluster_id": 2,
+      "size_sw_neutral": 0.2600513429391374,
+      "value_sw_neutral": -0.34276751280428497,
+      "mom1m_sw_neutral": -0.06025513607021813
+    },
+    {
+      "cluster_id": 3,
+      "size_sw_neutral": -0.23749251394893722,
+      "value_sw_neutral": 0.057509542224780774,
+      "mom1m_sw_neutral": 0.33111875577495387
+    },
+    {
+      "cluster_id": 4,
+      "size_sw_neutral": -0.17756934120538762,
+      "value_sw_neutral": 0.026152358826769993,
+      "mom1m_sw_neutral": -0.17732650264325314
+    }
+  ],
+  "graph_summary": {
+    "avg_degree": 10.84,
+    "median_degree": 12.0,
+    "avg_pagerank": -0.10599403868012601,
+    "isolated_count": 0
+  },
+  "data_quality": {
+    "close": {
+      "missing": 0,
+      "total": 100,
+      "pct": "0.0%"
+    },
+    "l1_name": {
+      "missing": 0,
+      "total": 100,
+      "pct": "0.0%"
+    }
+  },
+  "cluster_diagnostics": {
+    "silhouette_score": -0.021438779309391975,
+    "davies_bouldin_score": 6.426138810917107,
+    "calinski_harabasz_score": 1.0645783893919527,
+    "n_clusters": 5,
+    "cluster_size_std": 3.24037034920393,
+    "cluster_size_min": 16,
+    "cluster_size_max": 23
+  },
+  "conductance": 0.7837047629563116,
+  "nmi_sw_l2": 0.0,
+  "cluster_profile": [
+    {
+      "cluster_id": 0,
+      "count": 17,
+      "top_sw_l1": "医药",
+      "top_sw_l1_pct": 0.4117647058823529,
+      "sw_l1_entropy": 1.0368263465339387,
+      "avg_size_sw_neutral": 0.052863409373626595,
+      "avg_value_sw_neutral": -0.09248688053885813,
+      "avg_mom1m_sw_neutral": -0.17422172626930443,
+      "prototype_stocks": "000033.SZ,000079.SZ,000075.SZ"
+    },
+    {
+      "cluster_id": 1,
+      "count": 16,
+      "top_sw_l1": "银行",
+      "top_sw_l1_pct": 0.5625,
+      "sw_l1_entropy": 0.9840865027829147,
+      "avg_size_sw_neutral": 0.08733929505630111,
+      "avg_value_sw_neutral": -0.5316771455744976,
+      "avg_mom1m_sw_neutral": -0.34590719931090386,
+      "prototype_stocks": "000055.SZ,000045.SZ,000028.SZ"
+    },
+    {
+      "cluster_id": 2,
+      "count": 22,
+      "top_sw_l1": "医药",
+      "top_sw_l1_pct": 0.5,
+      "sw_l1_entropy": 1.0208880672106417,
+      "avg_size_sw_neutral": 0.2600513429391374,
+      "avg_value_sw_neutral": -0.3427675128042849,
+      "avg_mom1m_sw_neutral": -0.060255136070218145,
+      "prototype_stocks": "000057.SZ,000039.SZ,000062.SZ"
+    },
+    {
+      "cluster_id": 3,
+      "count": 22,
+      "top_sw_l1": "银行",
+      "top_sw_l1_pct": 0.4090909090909091,
+      "sw_l1_entropy": 1.0412597332159743,
+      "avg_size_sw_neutral": -0.23749251394893725,
+      "avg_value_sw_neutral": 0.057509542224780774,
+      "avg_mom1m_sw_neutral": 0.33111875577495387,
+      "prototype_stocks": "000071.SZ,000070.SZ,000088.SZ"
+    },
+    {
+      "cluster_id": 4,
+      "count": 23,
+      "top_sw_l1": "地产",
+      "top_sw_l1_pct": 0.391304347826087,
+      "sw_l1_entropy": 1.08501115715815,
+      "avg_size_sw_neutral": -0.17756934120538767,
+      "avg_value_sw_neutral": 0.026152358826770025,
+      "avg_mom1m_sw_neutral": -0.1773265026432532,
+      "prototype_stocks": "000069.SZ,000049.SZ,000004.SZ"
+    }
+  ]
+}

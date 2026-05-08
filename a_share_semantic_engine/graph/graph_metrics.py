@@ -35,11 +35,10 @@ def compute_graph_metrics(
     sources, targets = adj.nonzero()
     data = np.asarray(adj[sources, targets]).flatten()
 
-    degrees = np.zeros(N, dtype=np.float32)
-    np.add.at(degrees, sources, data)
-    np.add.at(degrees, targets, data)
-    metrics["degree"] = degrees.astype(np.float32)
-    metrics["weighted_degree"] = metrics["degree"].values
+    weighted_degree = np.asarray(adj.sum(axis=1)).ravel().astype(np.float32)
+    metrics["degree"] = weighted_degree
+    metrics["unweighted_degree"] = np.diff(adj.indptr).astype(np.int32)
+    metrics["weighted_degree"] = weighted_degree
 
     logger.info("computing pagerank...")
     pr = _pagerank(adj)
@@ -98,7 +97,7 @@ def _pagerank(adj: sparse.csr_matrix, alpha: float = 0.85, max_iter: int = 100, 
     N = adj.shape[0]
     out_deg = np.asarray(adj.sum(axis=1)).flatten()
     out_deg = np.where(out_deg == 0, 1, out_deg)
-    P = adj.tocsr()
+    P = adj.astype(np.float64).copy().tocsr()
     for i in range(N):
         P.data[P.indptr[i]:P.indptr[i+1]] /= out_deg[i]
     P = P.T.tocsr()
@@ -121,23 +120,29 @@ def _eigenvector_centrality(adj: sparse.csr_matrix, max_iter: int = 100, tol: fl
 
 
 def _betweenness_approx(adj: sparse.csr_matrix, n_samples: int = 100) -> np.ndarray:
-    N = adj.shape[0]
-    bet = np.zeros(N, dtype=np.float32)
-    rows, cols = adj.nonzero()
-    edges = list(zip(rows, cols))
+    try:
+        import networkx as nx
+        G = nx.from_scipy_sparse_array(adj, edge_attribute="weight")
+        bc = nx.betweenness_centrality(G, k=min(n_samples, len(G.nodes)), weight=None, seed=42)
+        return np.array([bc.get(i, 0.0) for i in range(adj.shape[0])], dtype=np.float32)
+    except Exception:
+        N = adj.shape[0]
+        bet = np.zeros(N, dtype=np.float32)
+        rows, cols = adj.nonzero()
+        edges = list(zip(rows, cols))
 
-    if len(edges) == 0:
+        if len(edges) == 0:
+            return bet
+
+        np.random.seed(42)
+        for _ in range(n_samples):
+            src = np.random.randint(0, N)
+            bfs_dist, bfs_parent = _bfs(adj, src)
+            for node in range(N):
+                if node != src and bfs_dist[node] >= 0:
+                    paths = _count_paths_to_root(node, bfs_parent)
+                    bet[node] += paths / n_samples
         return bet
-
-    np.random.seed(42)
-    for _ in range(n_samples):
-        src = np.random.randint(0, N)
-        bfs_dist, bfs_parent = _bfs(adj, src)
-        for node in range(N):
-            if node != src and bfs_dist[node] >= 0:
-                paths = _count_paths_to_root(node, bfs_parent)
-                bet[node] += paths / n_samples
-    return bet
 
 
 def _bfs(adj: sparse.csr_matrix, start: int):
@@ -185,32 +190,12 @@ def _clustering_coefficient(adj: sparse.csr_matrix) -> np.ndarray:
 
 
 def _kcore(adj: sparse.csr_matrix) -> np.ndarray:
-    N = adj.shape[0]
-    deg = np.asarray(adj.sum(axis=1)).flatten().astype(np.int32)
-    kcore = np.zeros(N, dtype=np.int32)
-    remaining = np.arange(N)
-    current_k = 1
-
-    while len(remaining) > 0:
-        min_deg = deg[remaining].min()
-        if min_deg < current_k:
-            break
-        to_remove = []
-        for i in remaining:
-            if deg[i] <= current_k:
-                kcore[i] = current_k
-                to_remove.append(i)
-        if not to_remove:
-            current_k += 1
-            continue
-        remaining = np.array([r for r in remaining if r not in set(to_remove)])
-        for i in to_remove:
-            for j in adj[i].indices:
-                if j in remaining:
-                    deg[j] -= 1
-
-    for i in remaining:
-        kcore[i] = current_k
+    import networkx as nx
+    A_bin = adj.copy()
+    A_bin.data[:] = 1
+    G = nx.from_scipy_sparse_array(A_bin)
+    core = nx.core_number(G)
+    kcore = np.array([core.get(i, 0) for i in range(adj.shape[0])], dtype=np.int32)
     return kcore
 
 

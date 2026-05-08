@@ -31,7 +31,7 @@ CN_FONTS = [
 ]
 
 
-def _setup_cn_font():
+def setup_chinese_font():
     if not HAS_MATPLOTLIB:
         return
     for font in CN_FONTS:
@@ -41,6 +41,10 @@ def _setup_cn_font():
             return
         except Exception:
             continue
+
+
+def _setup_cn_font():
+    setup_chinese_font()
 
 
 def plot_cluster_sizes(sizes: list[int], output_path: Path | None = None):
