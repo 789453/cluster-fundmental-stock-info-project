@@ -96,3 +96,21 @@ def save_all_graphs(
         paths[name] = p
 
     return paths
+
+
+def load_all_graphs(
+    input_dir: Path,
+) -> dict[str, sparse.csr_matrix]:
+    """
+    Load multiple CSR graphs from .npz files in a directory.
+    """
+    input_dir = Path(input_dir)
+    graphs = {}
+
+    for p in input_dir.glob("graph_*.csr.npz"):
+        name = p.name.replace("graph_", "").replace(".csr.npz", "")
+        adj = sparse.load_npz(str(p))
+        graphs[name] = adj
+        logger.info("Loaded graph '%s': shape=%s", name, adj.shape)
+
+    return graphs

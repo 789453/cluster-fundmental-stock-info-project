@@ -31,18 +31,20 @@ class VectorStore:
         self.meta_dir = Path(meta_dir) if meta_dir else self.npy_root.parent / "metadata"
         self._views: dict[str, np.ndarray] = {}
         self._row_ids: dict[str, list[str]] = {}
+        self._stock_codes: dict[str, list[str]] = {}
         self._meta_cache: dict[str, dict] = {}
 
-    def load_view(self, view: str) -> tuple[np.ndarray, list[str]]:
+    def load_view(self, view: str) -> tuple[np.ndarray, list[str], list[str]]:
         """
-        Load a single view's vectors and row_ids from merged npy + meta.json.
+        Load a single view's vectors, row_ids, and stock_codes.
 
         Returns:
             vectors: float32 array shape (N, 1024)
-            row_ids: list of record_id strings aligned to rows
+            row_ids: list of record_id strings
+            stock_codes: list of stock_code strings
         """
         if view in self._views:
-            return self._views[view], self._row_ids[view]
+            return self._views[view], self._row_ids[view], self._stock_codes[view]
 
         meta_path = self.meta_dir / f"records.jsonl"
         npy_path = self.npy_root / view / f"{view}-all.npy"
@@ -53,23 +55,29 @@ class VectorStore:
         vectors = np.load(npy_path).astype(np.float32)
 
         row_ids: list[str] = []
+        stock_codes: list[str] = []
         if meta_path.exists():
             with open(meta_path, encoding="utf-8") as f:
                 for line in f:
                     rec = json.loads(line)
                     if view in rec.get("vector_paths", {}):
-                        row_ids.append(rec.get("record_id", rec.get("ts_code", "")))
+                        row_ids.append(rec.get("record_id", ""))
+                        stock_codes.append(rec.get("stock_code", rec.get("ts_code", "")))
 
         if not row_ids:
             row_ids = [f"row_{i}" for i in range(len(vectors))]
+        if not stock_codes:
+            stock_codes = row_ids
 
         if len(row_ids) != len(vectors):
             logger.warning("row_id count (%d) != vector rows (%d), padding", len(row_ids), len(vectors))
             while len(row_ids) < len(vectors):
                 row_ids.append(f"row_{len(row_ids)}")
+                stock_codes.append(f"row_{len(stock_codes)}")
 
         self._views[view] = vectors
         self._row_ids[view] = row_ids
+        self._stock_codes[view] = stock_codes
         self._meta_cache[view] = {
             "view": view,
             "rows": len(vectors),
@@ -77,18 +85,30 @@ class VectorStore:
             "dtype": str(vectors.dtype),
         }
         logger.info("Loaded view '%s': shape=%s, dtype=%s", view, vectors.shape, vectors.dtype)
-        return vectors, row_ids
+        return vectors, row_ids, stock_codes
 
-    def get_index(self, view: str, ts_codes: list[str]) -> np.ndarray | None:
+    def get_index(self, view: str, keys: list[str]) -> np.ndarray | None:
         """
-        Get vector row indices for a list of ts_codes.
-        Requires alignment between ts_code and row_id.
+        Get vector row indices for a list of keys (either record_ids or stock_codes).
         """
-        _, row_ids = self.load_view(view)
-        code_to_idx: dict[str, int] = {}
+        _, row_ids, stock_codes = self.load_view(view)
+        
+        # Try record_id first, then stock_code
+        key_to_idx: dict[str, int] = {}
         for i, rid in enumerate(row_ids):
-            code_to_idx[rid] = i
-        indices = [code_to_idx[c] for c in ts_codes if c in code_to_idx]
+            if rid: key_to_idx[rid] = i
+        for i, code in enumerate(stock_codes):
+            if code: key_to_idx[code] = i
+            
+        indices = [key_to_idx[k] for k in keys if k in key_to_idx]
+        
+        # DEBUG PRINT
+        if not indices and keys:
+            print(f"\nDEBUG: get_index failed for {view}")
+            print(f"DEBUG: Sample keys: {keys[:3]}")
+            print(f"DEBUG: Sample row_ids: {row_ids[:3]}")
+            print(f"DEBUG: Sample stock_codes: {stock_codes[:3]}\n")
+            
         return np.array(indices) if indices else None
 
     def l2_normalize(self, vectors: np.ndarray) -> np.ndarray:
@@ -194,24 +214,22 @@ def _exact_knn(vectors: np.ndarray, k: int, min_sim: float, mutual: bool):
 def _faiss_knn(vectors: np.ndarray, k: int, min_sim: float, mutual: bool, backend: str, device_id: int):
     N, D = vectors.shape
     k = min(k, N - 1)
+    
+    X = np.ascontiguousarray(vectors.astype(np.float32))
 
-    if backend == "faiss_gpu" and HAS_FAISS:
+    if backend == "faiss_gpu" and HAS_FAISS and hasattr(faiss, 'StandardGpuResources'):
         res = faiss.StandardGpuResources()
         flat = faiss.GpuIndexFlatIP(res, D)
-        flat.add(vectors)
-        sims, idxs = flat.search(vectors, k + 1)
+        flat.add(X)
+        sims, idxs = flat.search(X, k + 1)
         sims = sims[:, 1:].astype(np.float32)
         idxs = idxs[:, 1:].astype(np.int32)
     else:
-        index = faiss.IndexFlatIP(D)
         if backend == "faiss_gpu":
-            co = faiss.GpuClonerOptions()
-            gpu_index = faiss.GpuIndexFlatIP(index, device_id, co)
-            gpu_index.add(vectors)
-            sims, idxs = gpu_index.search(vectors, k + 1)
-        else:
-            index.add(vectors)
-            sims, idxs = index.search(vectors, k + 1)
+            logger.info("FAISS GPU not available, falling back to FAISS CPU")
+        index = faiss.IndexFlatIP(D)
+        index.add(X)
+        sims, idxs = index.search(X, k + 1)
         sims = sims[:, 1:].astype(np.float32)
         idxs = idxs[:, 1:].astype(np.int32)
 

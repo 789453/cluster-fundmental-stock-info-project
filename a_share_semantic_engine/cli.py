@@ -33,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_research.add_argument("--k-semantic", type=int, default=30)
     p_research.add_argument("--cluster-method", type=str, default="kmeans")
     p_research.add_argument("--use-cuda", action="store_true", default=False)
+    p_research.add_argument("--run-dir", type=str, default=None)
+    p_research.add_argument("--resume", action="store_true", default=False)
 
     return parser
 
@@ -98,7 +100,7 @@ def cmd_staged(trade_date: str, config_path: str, start_from: int, cluster_metho
     return 0
 
 
-def cmd_research(trade_date: str, config_path: str, k_semantic: int, cluster_method: str, use_cuda: bool) -> int:
+def cmd_research(trade_date: str, config_path: str, k_semantic: int, cluster_method: str, use_cuda: bool, run_dir: str | None = None, resume: bool = False) -> int:
     cfg = load_config(config_path)
     logger = setup_logging("research", None)
     paths = cfg["paths"]
@@ -121,6 +123,8 @@ def cmd_research(trade_date: str, config_path: str, k_semantic: int, cluster_met
         k_semantic=k_semantic,
         cluster_method=cluster_method,
         use_cuda=use_cuda,
+        run_dir=run_dir,
+        resume=resume,
     )
     print(f"research complete | trade_date={trade_date}")
     return 0
@@ -139,7 +143,7 @@ def main() -> int:
     if args.command == "staged":
         return cmd_staged(args.trade_date, args.config, args.start_from, args.cluster_method, args.use_cuda)
     if args.command == "research":
-        return cmd_research(args.trade_date, args.config, args.k_semantic, args.cluster_method, args.use_cuda)
+        return cmd_research(args.trade_date, args.config, args.k_semantic, args.cluster_method, args.use_cuda, args.run_dir, args.resume)
     raise SystemExit(2)
 
 

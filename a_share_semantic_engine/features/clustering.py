@@ -28,7 +28,7 @@ def run_clustering(
     seed = int(cfg.get("project", {}).get("random_state", 42))
     batch_size = int(cfg.get("cluster", {}).get("batch_size", 256))
     max_iter = int(cfg.get("cluster", {}).get("max_iter", 100))
-    labels, dists = run_kmeans(features, n_clusters=n_clusters, seed=seed, batch_size=batch_size, max_iter=max_iter)
+    labels, dists = run_kmeans(features, n_clusters=n_clusters, seed=seed, batch_size=batch_size, max_iter=max_iter, use_gpu=cfg.get("project", {}).get("use_gpu", True))
     return pd.DataFrame({"record_id": record_ids, "cluster_id": labels, "cluster_distance": dists}), None
 
 
@@ -38,23 +38,43 @@ def run_kmeans(
     seed: int = 42,
     batch_size: int = 256,
     max_iter: int = 100,
+    use_gpu: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    MiniBatchKMeans clustering. CPU fallback.
+    KMeans clustering. Uses FAISS if available, otherwise sklearn MiniBatchKMeans.
     """
-    from sklearn.cluster import MiniBatchKMeans
+    try:
+        import faiss
+        X = np.ascontiguousarray(features.astype(np.float32))
+        D = X.shape[1]
+        
+        # FAISS KMeans
+        # Check if GPU is actually available in FAISS
+        actual_gpu = use_gpu and hasattr(faiss, 'StandardGpuResources')
+        if use_gpu and not actual_gpu:
+            logger.info("FAISS GPU not available, using CPU for KMeans")
+            
+        kmeans = faiss.Kmeans(d=D, k=n_clusters, niter=max_iter, verbose=False, seed=seed, gpu=actual_gpu)
+        kmeans.train(X)
+        
+        dists, labels = kmeans.index.search(X, 1)
+        return labels.flatten().astype(np.int32), np.sqrt(dists.flatten()).astype(np.float32)
+        
+    except (ImportError, AttributeError, Exception) as e:
+        logger.warning("FAISS KMeans failed or not available (Error: %s), falling back to sklearn MiniBatchKMeans", e)
+        from sklearn.cluster import MiniBatchKMeans
 
-    model = MiniBatchKMeans(
-        n_clusters=n_clusters,
-        batch_size=batch_size,
-        max_iter=max_iter,
-        random_state=seed,
-        n_init="auto",
-    )
-    labels = model.fit_predict(features)
-    centers = model.cluster_centers_[labels]
-    dists = np.linalg.norm(features - centers, axis=1).astype(np.float32)
-    return labels.astype(np.int32), dists
+        model = MiniBatchKMeans(
+            n_clusters=n_clusters,
+            batch_size=batch_size,
+            max_iter=max_iter,
+            random_state=seed,
+            n_init="auto",
+        )
+        labels = model.fit_predict(features)
+        centers = model.cluster_centers_[labels]
+        dists = np.linalg.norm(features - centers, axis=1).astype(np.float32)
+        return labels.astype(np.int32), dists
 
 
 def run_hdbscan(

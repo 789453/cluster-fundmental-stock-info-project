@@ -46,130 +46,192 @@ def run_research_pipeline(
     cluster_method: str = "kmeans",
     fusion_weights: dict[str, float] | None = None,
     use_cuda: bool = True,
+    run_dir: str | Path | None = None,
+    resume: bool = False,
 ) -> dict:
     t0 = time.time()
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    if run_dir:
+        run_dir = Path(run_dir)
+    elif resume:
+        # Find latest run for this trade_date
+        existing_runs = sorted(output_dir.glob(f"run_{trade_date}_*"))
+        if existing_runs:
+            run_dir = existing_runs[-1]
+            logger.info("Resuming from latest run: %s", run_dir)
+        else:
+            run_id = f"run_{trade_date}_{int(time.time())}"
+            run_dir = output_dir / run_id
+    else:
+        run_id = f"run_{trade_date}_{int(time.time())}"
+        run_dir = output_dir / run_id
 
-    run_dir = output_dir / f"run_{trade_date}_{int(time.time())}"
-    for sub in ["exports", "graphs", "figures", "reports"]:
+    # Ensure all subdirectories exist
+    for sub in ["reports", "exports", "figures", "graphs"]:
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 60)
     logger.info("Research pipeline | trade_date=%s | cluster_method=%s", trade_date, cluster_method)
     logger.info("=" * 60)
 
-    logger.info("[1/9] Building stock snapshot...")
-    snap = build_stock_snapshot(trade_date, warehouse_db)
+    # 1. Snapshot
+    snap_path = run_dir / "snapshot.parquet"
+    if snap_path.exists():
+        logger.info("[1/9] Loading existing snapshot from %s", snap_path)
+        snap = pd.read_parquet(snap_path)
+    else:
+        logger.info("[1/9] Building stock snapshot...")
+        from ..data.snapshot_builder import build_stock_snapshot
+        snap = build_stock_snapshot(trade_date, warehouse_db)
+        snap.to_parquet(snap_path)
+    
     ts_codes = snap["ts_code"].tolist()
-    N = len(ts_codes)
+    N = len(snap)
     logger.info("  snapshot: %d stocks", N)
-
+    
     if n_clusters is None:
         n_clusters = max(10, int(N / 50))
 
-    logger.info("[2/9] Barra-style exposures...")
-    snap = build_barra_style_exposures(snap, industry_col="l1_name")
+    # 2. Barra-style exposures
+    style_path = run_dir / "snapshot_with_style.parquet"
+    if style_path.exists():
+        logger.info("[2/9] Loading existing style exposures from %s", style_path)
+        snap = pd.read_parquet(style_path)
+    else:
+        logger.info("[2/9] Calculating Barra-style exposures...")
+        snap = build_barra_style_exposures(snap, industry_col="l1_name")
+        snap.to_parquet(style_path)
+
     style_cols = [c for c in snap.columns if c.endswith("_sw_neutral") or c in [
         "Size", "NonlinearSize", "Value", "Momentum", "ShortReversal",
         "Volatility", "Liquidity", "Profitability", "Growth", "Leverage", "EarningsQuality",
     ]]
 
-    logger.info("[3/9] Loading semantic vectors...")
-    from ..graph.graph_builder import VectorStore
-    vs = VectorStore(npy_root)
-    available_views = ["full_text", "profile_text", "product_text", "raw_json"]
-    view_to_use = None
-    for v in available_views:
-        try:
-            vs.load_view(v)
-            view_to_use = v
-            logger.info("  using view '%s'", v)
-            break
-        except FileNotFoundError:
-            continue
+    # 3. Semantic Vectors
+    feat_mat_path = run_dir / "feature_matrix.npy"
+    if feat_mat_path.exists():
+        logger.info("[3/9] Loading existing feature matrix from %s", feat_mat_path)
+        feat_matrix = np.load(feat_mat_path)
+    else:
+        logger.info("[3/9] Loading semantic vectors...")
+        from ..graph.graph_builder import VectorStore
+        vs = VectorStore(npy_root)
+        available_views = ["full_text", "profile_text", "product_text", "raw_json"]
+        view_to_use = None
+        for v in available_views:
+            try:
+                vs.load_view(v)
+                view_to_use = v
+                logger.info("  using view '%s'", v)
+                break
+            except FileNotFoundError:
+                continue
 
-    if view_to_use:
-        vectors, _ = vs.load_view(view_to_use)
-        idx_map = vs.get_index(view_to_use, ts_codes)
-        if idx_map is not None and len(idx_map) == N:
-            feat_matrix = vectors[idx_map]
+        if view_to_use:
+            vectors, row_ids, stock_codes_vec = vs.load_view(view_to_use)
+            key_to_vec_idx = {}
+            for i, rid in enumerate(row_ids):
+                if rid: key_to_vec_idx[rid] = i
+            for i, code in enumerate(stock_codes_vec):
+                if code: key_to_vec_idx[code] = i
+                
+            feat_matrix = np.zeros((N, vectors.shape[1]), dtype=np.float32)
+            matched_count = 0
+            for i, row in snap.iterrows():
+                idx = None
+                if "record_id" in row and row["record_id"] in key_to_vec_idx:
+                    idx = key_to_vec_idx[row["record_id"]]
+                elif row["ts_code"] in key_to_vec_idx:
+                    idx = key_to_vec_idx[row["ts_code"]]
+                if idx is not None:
+                    feat_matrix[i] = vectors[idx]
+                    matched_count += 1
+            if matched_count > 0:
+                logger.info("  aligned %d/%d stocks with semantic vectors", matched_count, N)
+            else:
+                feat_matrix = vectors[:N]
         else:
-            feat_matrix = vectors[:N]
+            fcols = ["close", "pct_chg", "turnover_rate", "pe_ttm", "roe", "total_mv"]
+            feat_matrix = snap[[c for c in fcols if c in snap.columns]].values.astype(np.float32)
+            feat_matrix = np.nan_to_num(feat_matrix, nan=0.0)
+
+        feat_matrix = vs.l2_normalize(feat_matrix)
+        np.save(feat_mat_path, feat_matrix)
+
+    # 4. Building all graphs
+    graph_dir = run_dir / "graphs"
+    if graph_dir.exists() and any(graph_dir.glob("*.npz")):
+        logger.info("[4/9] Loading existing graphs from %s", graph_dir)
+        from ..graph.edge_table import load_all_graphs
+        loaded_csrs = load_all_graphs(graph_dir)
+        # Note: We reconstruct the graph tuples for the pipeline
+        graphs = {k: (v, None, None, None) for k, v in loaded_csrs.items()}
     else:
-        logger.warning("No NPY views, using snapshot features as fallback")
-        fcols = ["close", "pct_chg", "turnover_rate", "pe_ttm", "roe", "total_mv"]
-        feat_matrix = snap[[c for c in fcols if c in snap.columns]].values.astype(np.float32)
+        logger.info("[4/9] Building all graphs...")
+        graphs: dict[str, tuple] = {}
 
-    feat_matrix = vs.l2_normalize(feat_matrix)
-    logger.info("  feature matrix: %s", feat_matrix.shape)
+        neigh_sem, dist_sem, w_sem = build_semantic_knn(
+            feat_matrix, k=k_semantic, min_sim=0.0, mutual=True,
+            backend="faiss_gpu" if (use_cuda) else "exact",
+        )
+        sem_csr, _, _ = build_csr_from_knn(neigh_sem, dist_sem, N)
+        graphs["semantic"] = (sem_csr, neigh_sem, dist_sem, w_sem)
 
-    logger.info("[4/9] Building all graphs...")
-    graphs: dict[str, tuple] = {}
+        sw_l1 = snap["l1_name"].fillna("").tolist()
+        sw_l2 = snap["l2_name"].fillna("").tolist()
+        sw_l3 = snap["l3_name"].fillna("").tolist()
+        neigh_ind, dist_ind, w_ind = build_industry_graph(ts_codes, sw_l1, sw_l2, sw_l3)
+        ind_csr, _, _ = build_csr_from_knn(neigh_ind, dist_ind, N)
+        graphs["industry"] = (ind_csr, neigh_ind, dist_ind, w_ind)
 
-    neigh_sem, dist_sem, w_sem = build_semantic_knn(
-        feat_matrix, k=k_semantic, min_sim=0.0, mutual=True,
-        backend="faiss_gpu" if (use_cuda) else "exact",
-    )
-    sem_csr, _, _ = build_csr_from_knn(neigh_sem, dist_sem, N)
-    graphs["semantic"] = (sem_csr, neigh_sem, dist_sem, w_sem)
+        fin_cols = [c for c in snap.columns if c in [
+            "roe", "roa", "roic", "grossprofit_margin", "debt_to_assets",
+            "turnover_rate", "pe_ttm", "pb", "netprofit_margin",
+        ]]
+        if len(fin_cols) >= 3:
+            fin_mat = snap[fin_cols].values.astype(np.float32)
+            fin_mat = np.nan_to_num(fin_mat, nan=0.0)
+            neigh_fin, dist_fin, w_fin = build_fundamental_graph(fin_mat, k=k_fundamental)
+            fin_csr, _, _ = build_csr_from_knn(neigh_fin, dist_fin, N)
+            graphs["fundamental"] = (fin_csr, neigh_fin, dist_fin, w_fin)
+        else:
+            graphs["fundamental"] = graphs["semantic"]
 
-    sw_l1 = snap["l1_name"].fillna("").tolist()
-    sw_l2 = snap["l2_name"].fillna("").tolist()
-    sw_l3 = snap["l3_name"].fillna("").tolist()
-    neigh_ind, dist_ind, w_ind = build_industry_graph(ts_codes, sw_l1, sw_l2, sw_l3)
-    ind_csr, _, _ = build_csr_from_knn(neigh_ind, dist_ind, N)
-    graphs["industry"] = (ind_csr, neigh_ind, dist_ind, w_ind)
+        ret_cols = [f"ret_{d}d" for d in [1, 5, 20, 60]]
+        avail_ret = [c for c in ret_cols if c in snap.columns]
+        if len(avail_ret) >= 2:
+            ret_mat = snap[avail_ret].values.astype(np.float32)
+            ret_mat = np.nan_to_num(ret_mat, nan=0.0)
+            neigh_ret, dist_ret, w_ret = build_return_corr_graph(ret_mat.T, k=k_return)
+            ret_csr, _, _ = build_csr_from_knn(neigh_ret, dist_ret, N)
+            graphs["return_corr"] = (ret_csr, neigh_ret, dist_ret, w_ret)
+        else:
+            graphs["return_corr"] = graphs["semantic"]
 
-    fin_cols = [c for c in snap.columns if c in [
-        "roe", "roa", "roic", "grossprofit_margin", "debt_to_assets",
-        "turnover_rate", "pe_ttm", "pb", "netprofit_margin",
-    ]]
-    if len(fin_cols) >= 3:
-        fin_mat = snap[fin_cols].values.astype(np.float32)
-        fin_mat = np.nan_to_num(fin_mat, nan=0.0)
-        neigh_fin, dist_fin, w_fin = build_fundamental_graph(fin_mat, k=k_fundamental)
-        fin_csr, _, _ = build_csr_from_knn(neigh_fin, dist_fin, N)
-        graphs["fundamental"] = (fin_csr, neigh_fin, dist_fin, w_fin)
-    else:
-        graphs["fundamental"] = graphs["semantic"]
+        if len(style_cols) > 0:
+            style_mat = snap[style_cols].values.astype(np.float32)
+            style_mat = np.nan_to_num(style_mat, nan=0.0)
+            neigh_sty, dist_sty, w_sty = build_style_graph(style_mat, k=k_style)
+            sty_csr, _, _ = build_csr_from_knn(neigh_sty, dist_sty, N)
+            graphs["style"] = (sty_csr, neigh_sty, dist_sty, w_sty)
+        else:
+            graphs["style"] = graphs["semantic"]
 
-    ret_cols = [f"ret_{d}d" for d in [1, 5, 20, 60]]
-    avail_ret = [c for c in ret_cols if c in snap.columns]
-    if len(avail_ret) >= 2:
-        ret_mat = snap[avail_ret].values.astype(np.float32)
-        ret_mat = np.nan_to_num(ret_mat, nan=0.0)
-        neigh_ret, dist_ret, w_ret = build_return_corr_graph(ret_mat.T, k=k_return)
-        ret_csr, _, _ = build_csr_from_knn(neigh_ret, dist_ret, N)
-        graphs["return_corr"] = (ret_csr, neigh_ret, dist_ret, w_ret)
-    else:
-        graphs["return_corr"] = graphs["semantic"]
-
-    if len(style_cols) > 0:
-        style_mat = snap[style_cols].values.astype(np.float32)
-        style_mat = np.nan_to_num(style_mat, nan=0.0)
-        neigh_sty, dist_sty, w_sty = build_style_graph(style_mat, k=k_style)
-        sty_csr, _, _ = build_csr_from_knn(neigh_sty, dist_sty, N)
-        graphs["style"] = (sty_csr, neigh_sty, dist_sty, w_sty)
-    else:
-        graphs["style"] = graphs["semantic"]
-
-    logger.info("[5/9] Fusing graphs...")
-    if fusion_weights is None:
-        fusion_weights = {
-            "semantic": 0.35,
-            "industry": 0.20,
-            "fundamental": 0.20,
-            "return_corr": 0.15,
-            "style": 0.10,
-        }
-
-    graph_dict_fuse = {k: (v[1], v[2]) for k, v in graphs.items()}
-    fused_neigh, fused_dists, fused_sim = fuse_multiplex_graphs(graph_dict_fuse, fusion_weights)
-    fused_csr, _, _ = build_csr_from_knn(fused_neigh, fused_dists, N)
-    graphs["fused"] = (fused_csr, fused_neigh, fused_dists, fused_dists)
-
-    save_all_graphs({k: v[0] for k, v in graphs.items()}, run_dir / "graphs")
+        # 5. Fusing graphs
+        logger.info("[5/9] Fusing graphs...")
+        if fusion_weights is None:
+            fusion_weights = {"semantic": 0.35, "industry": 0.20, "fundamental": 0.20, "return_corr": 0.15, "style": 0.10}
+        graph_dict_fuse = {k: (v[1], v[2]) for k, v in graphs.items() if v[1] is not None}
+        if not graph_dict_fuse:
+             # If loading from cache, we only have CSR. Use CSR for fusion if possible, or skip
+             fused_csr = graphs["semantic"][0] # fallback
+        else:
+             fused_neigh, fused_dists, fused_sim = fuse_multiplex_graphs(graph_dict_fuse, fusion_weights)
+             fused_csr, _, _ = build_csr_from_knn(fused_neigh, fused_dists, N)
+        
+        graphs["fused"] = (fused_csr, None, None, None)
+        save_all_graphs({k: v[0] for k, v in graphs.items()}, run_dir / "graphs")
 
     logger.info("[6/9] Clustering (%s)...", cluster_method)
     if cluster_method == "kmeans":
@@ -189,6 +251,9 @@ def run_research_pipeline(
 
     n_actual_clusters = int(labels.max()) + 1
     logger.info("  clusters: %d", n_actual_clusters)
+
+    # Ensure we have the fused CSR for metrics
+    fused_csr = graphs["fused"][0]
 
     logger.info("[7/9] Computing graph + cluster metrics...")
     snap["cluster_id"] = labels

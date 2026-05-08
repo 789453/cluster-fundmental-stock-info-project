@@ -4,7 +4,11 @@ import logging
 import numpy as np
 import pandas as pd
 
-from ..data.asof_join import cross_section_winsorize, industry_neutralize
+from ..features.cross_section import (
+    cross_section_winsorize,
+    industry_neutralize,
+    fill_missing_with_industry_median,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +90,7 @@ def build_barra_style_exposures(
     avail = [c for c in all_style_src if c in result.columns]
     result = cross_section_winsorize(result, avail, winsorize_lower, winsorize_upper, group_col=None)
 
-    result = _fill_missing_with_industry_median(result, avail, industry_col)
+    result = fill_missing_with_industry_median(result, avail, industry_col)
 
     style_defs = {
         "Size":          ["total_mv"],
@@ -131,31 +135,6 @@ def build_barra_style_exposures(
         len([s for s in style_defs if s in result.columns]),
         len(neutral_cols),
     )
-    return result
-
-
-def _fill_missing_with_industry_median(
-    df: pd.DataFrame,
-    cols: list[str],
-    industry_col: str,
-) -> pd.DataFrame:
-    result = df.copy()
-    if industry_col not in result.columns:
-        return result
-
-    for col in cols:
-        if col not in result.columns:
-            continue
-        missing = result[col].isna()
-        if missing.sum() == 0:
-            continue
-        medians = result.groupby(industry_col)[col].transform("median")
-        result.loc[missing, col] = medians[missing]
-        still_missing = result[col].isna()
-        if still_missing.sum() > 0:
-            global_median = result[col].median()
-            result.loc[still_missing, col] = global_median
-
     return result
 
 

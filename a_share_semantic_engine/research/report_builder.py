@@ -52,20 +52,30 @@ def build_research_report(
     snapshot_df = snapshot_df.copy()
 
     if "cluster_id" in cluster_df.columns:
+        # Ensure ts_code is string and remove potential duplicates
         cluster_sub = cluster_df[["ts_code", "cluster_id", "cluster_distance"]].copy()
         cluster_sub["ts_code"] = cluster_sub["ts_code"].astype(str)
+        
         snap_copy = snapshot_df.copy()
         snap_copy["ts_code"] = snap_copy["ts_code"].astype(str)
+        
+        # Merge using ts_code
         merged = snap_copy.merge(cluster_sub, on="ts_code", how="left")
-        if "cluster_id" not in merged.columns:
-            merged["cluster_id"] = 0
+        
+        # Fill missing clusters with -1
+        if "cluster_id" in merged.columns:
+            merged["cluster_id"] = merged["cluster_id"].fillna(-1).astype(int)
+        else:
+            merged["cluster_id"] = -1
     else:
         merged = snapshot_df.copy()
-        merged["cluster_id"] = 0
+        merged["cluster_id"] = -1
 
-    cid_max = merged["cluster_id"].max()
-    n_clusters = int(cid_max) + 1 if pd.notna(cid_max) and int(cid_max) >= 0 else 0
+    # Count actual clusters (excluding -1)
+    unique_cids = sorted([int(c) for c in merged["cluster_id"].unique() if c >= 0])
+    n_clusters = len(unique_cids)
     report["n_clusters"] = n_clusters
+    report["n_unclustered"] = int((merged["cluster_id"] < 0).sum())
 
     cluster_stats = []
     if "cluster_id" in merged.columns:
@@ -161,7 +171,7 @@ def print_report_summary(report: dict[str, Any]) -> None:
     cs = report.get("cluster_stats", [])
     top = sorted(cs, key=lambda x: x["count"], reverse=True)[:5]
     for c in top:
-        print(f"    Cluster {c['cluster_id']}: {c['count']} stocks, "
-              f"top industry: {c['top_sw_l1']} ({c['top_sw_l1_pct']:.0%}), "
-              f"avg ROE: {c['avg_roe']:.2%}")
+        print(f"    Cluster {c['cluster_id']:>3}: {c['count']:>4} stocks | "
+              f"Industry: {c['top_sw_l1']:<10} ({c['top_sw_l1_pct']:>4.0%}) | "
+              f"ROE: {c['avg_roe']:>7.2f}%")
     print(f"{'='*60}\n")

@@ -79,12 +79,35 @@ def build_stock_snapshot(
     if not include_st:
         df = df[~df["name"].str.contains("ST", na=False)]
 
-    if not include_suspended:
-        df = df[df["vol"] > 0]
-
-    df["trade_date"] = df["trade_date"].astype(str)
+    df = df[df["vol"] > 0]
 
     td_str = str(trade_date)
+    df["trade_date"] = df["trade_date"].astype(str)
+
+    # Add record_id from semantic dataset if possible for alignment
+    semantic_path = Path("artifacts/a_share_semantic_dataset/parquet/records-all.parquet")
+    if semantic_path.exists():
+        # Use pandas for an efficient as-of join with semantic records
+        try:
+            semantic_records = pd.read_parquet(semantic_path, columns=["record_id", "stock_code", "asof_date"])
+            semantic_records["asof_date_fmt"] = semantic_records["asof_date"].str.replace("-", "")
+            
+            # We want the latest record_id for each stock where asof_date <= trade_date
+            s = semantic_records[semantic_records["asof_date_fmt"] <= td_str].copy()
+            if not s.empty:
+                s = s.sort_values("asof_date_fmt", ascending=False).drop_duplicates("stock_code")
+                df = df.merge(s[["stock_code", "record_id"]], left_on="ts_code", right_on="stock_code", how="left")
+                df.drop(columns=["stock_code"], inplace=True)
+                logger.info("  joined record_id from semantic dataset (as-of join via pandas)")
+            else:
+                df["record_id"] = df["ts_code"] + "_" + df["trade_date"]
+                logger.warning("  no semantic records found for asof_date <= %s", td_str)
+        except Exception as e:
+            logger.warning("  failed to join record_id via pandas: %s. Using fallback.", e)
+            df["record_id"] = df["ts_code"] + "_" + df["trade_date"]
+    else:
+        df["record_id"] = df["ts_code"] + "_" + df["trade_date"]
+
     sw_active = sw_member[
         (sw_member["in_date"].astype(str) <= td_str) &
         ((sw_member["out_date"].isna()) | (sw_member["out_date"].astype(str) > td_str) | (sw_member["out_date"] == 0))
