@@ -1,0 +1,58 @@
+project:
+  name: a_share_semantic_engine_research
+  random_state: 42
+  use_gpu: true
+  include_st: false
+  include_suspended: false
+
+paths:
+  records_path: "d:/Trading/a_share_semantic_engine_project/artifacts/a_share_semantic_dataset/parquet/records-all.parquet"
+  npy_root: "d:/Trading/a_share_semantic_engine_project/artifacts/a_share_semantic_dataset/npy"
+  warehouse_db: "D:/Trading/data_ever_26_3_14/data/meta/warehouse.duckdb"
+  output_root: "outputs/research_run"
+  gold_root: "data/gold/snapshots"
+  silver_root: "data/silver"
+  marts_root: "data/marts"
+
+views:
+  text_views:
+    - product_text
+    - profile_text
+    - model_text
+    - chain_text
+    - theme_text
+  json_views:
+    - business_model_json
+    - industry_chain_position_json
+    - business_logic_json
+  anchor_fields:
+    - biz_form
+    - customer_side
+    - chain_level
+    - industry
+    - market
+
+embedding:
+  dtype: float32
+  normalize: true
+
+graph:
+  k: 30
+  min_sim: 0.15
+  mutual: true
+  weights:
+    semantic: 0.35
+    industry: 0.20
+    fundamental: 0.20
+    return_corr: 0.15
+    style: 0.10
+
+cluster:
+  method: leiden
+  n_clusters: 50
+  max_iter: 100
+
+export:
+  write_parquet: true
+  write_csv: false
+  write_figures: true

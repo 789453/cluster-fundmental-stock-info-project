@@ -1,0 +1,15 @@
+{
+  "total_stocks": 100,
+  "total_fields": 5,
+  "vector_coverage": 1.0,
+  "missing_by_field": {},
+  "inf_by_field": {},
+  "dtypes": {
+    "ts_code": "str",
+    "close": "float64",
+    "l1_name": "str",
+    "cluster_id": "int32",
+    "trade_date": "str"
+  },
+  "quality_flags": []
+}
